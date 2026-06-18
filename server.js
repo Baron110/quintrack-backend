@@ -404,3 +404,111 @@ function genId() {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚚 QUIN-TRACK API on port ${PORT}`));
+
+// ══════════════════
+//  CHAT / SUPPORT
+// ══════════════════
+
+const chatSchema = new mongoose.Schema({
+  sessionId:  { type: String, required: true, index: true },
+  userName:   { type: String, default: 'Guest' },
+  userEmail:  { type: String, default: '' },
+  messages:   [{
+    role:      { type: String, enum: ['user','admin'], required: true },
+    text:      { type: String, required: true },
+    timestamp: { type: Date, default: Date.now }
+  }],
+  unread:     { type: Number, default: 0 },
+  resolved:   { type: Boolean, default: false },
+  createdAt:  { type: Date, default: Date.now },
+  updatedAt:  { type: Date, default: Date.now }
+});
+const Chat = mongoose.model('Chat', chatSchema);
+
+// PUBLIC: Start or get chat session
+app.post('/api/chat/session', async (req, res) => {
+  try {
+    const { sessionId, userName, userEmail } = req.body;
+    let chat = await Chat.findOne({ sessionId });
+    if (!chat) {
+      chat = await Chat.create({ sessionId, userName: userName||'Guest', userEmail: userEmail||'', messages: [] });
+    }
+    res.json(chat);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PUBLIC: Send message (user)
+app.post('/api/chat/message', async (req, res) => {
+  try {
+    const { sessionId, text, userName, userEmail } = req.body;
+    if (!sessionId || !text) return res.status(400).json({ error: 'Missing fields' });
+    const chat = await Chat.findOneAndUpdate(
+      { sessionId },
+      {
+        $push: { messages: { role: 'user', text, timestamp: new Date() } },
+        $inc:  { unread: 1 },
+        $set:  { updatedAt: new Date(), userName: userName||'Guest', userEmail: userEmail||'' }
+      },
+      { new: true, upsert: true }
+    );
+    res.json(chat);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PUBLIC: Get messages for a session
+app.get('/api/chat/session/:sessionId', async (req, res) => {
+  try {
+    const chat = await Chat.findOne({ sessionId: req.params.sessionId });
+    if (!chat) return res.json({ messages: [] });
+    res.json(chat);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ADMIN: Get all chat sessions
+app.get('/api/chat/sessions', authRequired, async (req, res) => {
+  try {
+    const chats = await Chat.find().sort({ updatedAt: -1 }).lean();
+    res.json(chats);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ADMIN: Reply to a chat
+app.post('/api/chat/reply', authRequired, async (req, res) => {
+  try {
+    const { sessionId, text } = req.body;
+    if (!sessionId || !text) return res.status(400).json({ error: 'Missing fields' });
+    const chat = await Chat.findOneAndUpdate(
+      { sessionId },
+      {
+        $push: { messages: { role: 'admin', text, timestamp: new Date() } },
+        $set:  { updatedAt: new Date() }
+      },
+      { new: true }
+    );
+    res.json(chat);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ADMIN: Mark session as read
+app.patch('/api/chat/session/:sessionId/read', authRequired, async (req, res) => {
+  try {
+    await Chat.findOneAndUpdate({ sessionId: req.params.sessionId }, { $set: { unread: 0 } });
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ADMIN: Mark session as resolved
+app.patch('/api/chat/session/:sessionId/resolve', authRequired, async (req, res) => {
+  try {
+    await Chat.findOneAndUpdate({ sessionId: req.params.sessionId }, { $set: { resolved: true, unread: 0 } });
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ADMIN: Total unread count
+app.get('/api/chat/unread', authRequired, async (req, res) => {
+  try {
+    const result = await Chat.aggregate([{ $group: { _id: null, total: { $sum: '$unread' } } }]);
+    res.json({ unread: result[0]?.total || 0 });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
