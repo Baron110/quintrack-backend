@@ -81,11 +81,21 @@ async function sendTrackingEmail(shipment, trackingUrl) {
   const recipientEmail = shipment.receiver?.email;
   if (!recipientEmail) return;
   const fromEmail = process.env.FROM_EMAIL || 'onboarding@resend.dev';
+
+  const statusMessages = {
+    'Pending':          { subject: `Your Shipment ${shipment.id} Has Been Registered`, heading: 'Your shipment has been registered! 📋', body: `Hi <strong style="color:#111827;">${shipment.receiver?.name || 'there'}</strong>, your shipment has been registered and is being prepared for dispatch.` },
+    'In Transit':       { subject: `Your Shipment ${shipment.id} Is Currently In Transit`, heading: 'Your shipment is on its way! 🚚', body: `Hi <strong style="color:#111827;">${shipment.receiver?.name || 'there'}</strong>, your shipment is currently in transit and being tracked in real-time.` },
+    'Out for Delivery': { subject: `Your Shipment ${shipment.id} Is Out for Delivery!`, heading: 'Your shipment is out for delivery! 🏃', body: `Hi <strong style="color:#111827;">${shipment.receiver?.name || 'there'}</strong>, great news — your shipment is out for delivery and should arrive soon!` },
+    'Delivered':        { subject: `Your Shipment ${shipment.id} Has Been Delivered`, heading: 'Your shipment has been delivered! ✅', body: `Hi <strong style="color:#111827;">${shipment.receiver?.name || 'there'}</strong>, your shipment has been successfully delivered. Thank you for using QUIN-TRACK.` },
+  };
+
+  const msg = statusMessages[shipment.status] || statusMessages['Pending'];
+
   try {
     await resend.emails.send({
       from: `QUIN-TRACK Logistics <${fromEmail}>`,
       to: recipientEmail,
-      subject: `Your Shipment ${shipment.id} Has Been Created — QUIN-TRACK`,
+      subject: `${msg.subject} — QUIN-TRACK`,
       html: `<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/></head>
@@ -113,8 +123,8 @@ async function sendTrackingEmail(shipment, trackingUrl) {
         </tr>
         <tr>
           <td style="padding:32px 36px 0;">
-            <h1 style="font-size:22px;font-weight:800;color:#111827;margin:0 0 8px;letter-spacing:-0.02em;">Your shipment is on its way! 🚚</h1>
-            <p style="color:#6b7280;font-size:15px;margin:0;line-height:1.6;">Hi <strong style="color:#111827;">${shipment.receiver?.name || 'there'}</strong>, your package has been registered and is now being tracked in real-time.</p>
+            <h1 style="font-size:22px;font-weight:800;color:#111827;margin:0 0 8px;letter-spacing:-0.02em;">${msg.heading}</h1>
+            <p style="color:#6b7280;font-size:15px;margin:0;line-height:1.6;">${msg.body}</p>
           </td>
         </tr>
         <tr>
