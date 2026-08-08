@@ -92,7 +92,7 @@ async function sendTrackingEmail(shipment, trackingUrl) {
   const msg = statusMessages[shipment.status] || statusMessages['Pending'];
 
   try {
-    await resend.emails.send({
+    const result = await resend.emails.send({
       from: `QUIN-TRACK Logistics <${fromEmail}>`,
       to: recipientEmail,
       subject: `${msg.subject} — QUIN-TRACK`,
@@ -195,7 +195,11 @@ async function sendTrackingEmail(shipment, trackingUrl) {
 </body>
 </html>`
     });
-    console.log(`✅ Email sent to ${recipientEmail}`);
+    if (result.error) {
+      console.error('❌ Email error (Resend rejected it):', result.error.message || JSON.stringify(result.error));
+    } else {
+      console.log(`✅ Email sent to ${recipientEmail} (id: ${result.data?.id})`);
+    }
   } catch (err) {
     console.error('❌ Email error:', err?.message);
   }
@@ -208,7 +212,7 @@ async function sendStatusUpdateEmail(shipment, trackingUrl) {
   const fromEmail = process.env.FROM_EMAIL || 'onboarding@resend.dev';
   const statusColor = {'Pending':'#d97706','In Transit':'#2563eb','Out for Delivery':'#0891b2','Delivered':'#16a34a'}[shipment.status] || '#2563eb';
   try {
-    await resend.emails.send({
+    const result = await resend.emails.send({
       from: `QUIN-TRACK Logistics <${fromEmail}>`,
       to: recipientEmail,
       subject: `Shipment Update: ${shipment.id} is now ${shipment.status} — QUIN-TRACK`,
@@ -290,7 +294,11 @@ async function sendStatusUpdateEmail(shipment, trackingUrl) {
 </body>
 </html>`
     });
-    console.log(`✅ Status update email sent to ${recipientEmail}`);
+    if (result.error) {
+      console.error('❌ Status email error (Resend rejected it):', result.error.message || JSON.stringify(result.error));
+    } else {
+      console.log(`✅ Status update email sent to ${recipientEmail} (id: ${result.data?.id})`);
+    }
   } catch (err) {
     console.error('❌ Status email error:', err?.message);
   }
@@ -415,7 +423,8 @@ const chatSchema = new mongoose.Schema({
   userEmail:  { type: String, default: '' },
   messages:   [{
     role:      { type: String, enum: ['user','admin'], required: true },
-    text:      { type: String, required: true },
+    text:      { type: String, default: '' },
+    image:     { type: String, default: null },
     timestamp: { type: Date, default: Date.now }
   }],
   unread:     { type: Number, default: 0 },
@@ -440,12 +449,12 @@ app.post('/api/chat/session', async (req, res) => {
 // PUBLIC: Send message (user)
 app.post('/api/chat/message', async (req, res) => {
   try {
-    const { sessionId, text, userName, userEmail } = req.body;
-    if (!sessionId || !text) return res.status(400).json({ error: 'Missing fields' });
+    const { sessionId, text, image, userName, userEmail } = req.body;
+    if (!sessionId || (!text && !image)) return res.status(400).json({ error: 'Missing fields' });
     const chat = await Chat.findOneAndUpdate(
       { sessionId },
       {
-        $push: { messages: { role: 'user', text, timestamp: new Date() } },
+        $push: { messages: { role: 'user', text: text||'', image: image||null, timestamp: new Date() } },
         $inc:  { unread: 1 },
         $set:  { updatedAt: new Date(), userName: userName||'Guest', userEmail: userEmail||'' }
       },
@@ -475,12 +484,12 @@ app.get('/api/chat/sessions', authRequired, async (req, res) => {
 // ADMIN: Reply to a chat
 app.post('/api/chat/reply', authRequired, async (req, res) => {
   try {
-    const { sessionId, text } = req.body;
-    if (!sessionId || !text) return res.status(400).json({ error: 'Missing fields' });
+    const { sessionId, text, image } = req.body;
+    if (!sessionId || (!text && !image)) return res.status(400).json({ error: 'Missing fields' });
     const chat = await Chat.findOneAndUpdate(
       { sessionId },
       {
-        $push: { messages: { role: 'admin', text, timestamp: new Date() } },
+        $push: { messages: { role: 'admin', text: text||'', image: image||null, timestamp: new Date() } },
         $set:  { updatedAt: new Date() }
       },
       { new: true }
