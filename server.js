@@ -66,7 +66,15 @@ async function seedSecondAdmin() {
   if (!process.env.ADMIN2_PASSWORD) return;
   const username = process.env.ADMIN2_USERNAME || 'admin2';
   if (username === (process.env.ADMIN_USERNAME || 'admin')) throw new Error('Admin usernames must differ');
-  if (!await Admin.exists({ username })) await Admin.create({ username, password: await bcrypt.hash(process.env.ADMIN2_PASSWORD, 10) });
+  const password = process.env.ADMIN2_PASSWORD;
+  const admin = await Admin.findOne({ username });
+  if (!admin) {
+    await Admin.create({ username, password: await bcrypt.hash(password, 10) });
+  } else if (!await bcrypt.compare(password, admin.password)) {
+    admin.password = await bcrypt.hash(password, 10);
+    await admin.save();
+    console.log('Admin 2 password synchronized from environment');
+  }
 }
 Promise.all([seedAdmin(), seedSecondAdmin()]).catch(err => { console.error('Admin setup failed:', err.message); process.exit(1); });
 
