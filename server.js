@@ -62,7 +62,13 @@ async function seedAdmin() {
     console.log('✅ Admin created');
   }
 }
-seedAdmin();
+async function seedSecondAdmin() {
+  if (!process.env.ADMIN2_PASSWORD) return;
+  const username = process.env.ADMIN2_USERNAME || 'admin2';
+  if (username === (process.env.ADMIN_USERNAME || 'admin')) throw new Error('Admin usernames must differ');
+  if (!await Admin.exists({ username })) await Admin.create({ username, password: await bcrypt.hash(process.env.ADMIN2_PASSWORD, 10) });
+}
+Promise.all([seedAdmin(), seedSecondAdmin()]).catch(err => { console.error('Admin setup failed:', err.message); process.exit(1); });
 
 // ── AUTH ──
 function authRequired(req, res, next) {
@@ -419,6 +425,7 @@ app.listen(PORT, () => console.log(`🚚 QUIN-TRACK API on port ${PORT}`));
 
 const chatSchema = new mongoose.Schema({
   sessionId:  { type: String, required: true, index: true },
+  assignedAdmin: { type: String, default: () => process.env.ADMIN_USERNAME || 'admin', index: true },
   userName:   { type: String, default: 'Guest' },
   userEmail:  { type: String, default: '' },
   messages:   [{
@@ -434,14 +441,26 @@ const chatSchema = new mongoose.Schema({
 });
 const Chat = mongoose.model('Chat', chatSchema);
 
+function supportUsername(target) {
+  return target === 'admin2' ? (process.env.ADMIN2_USERNAME || 'admin2') : (process.env.ADMIN_USERNAME || 'admin');
+}
+function adminChatFilter(req) {
+  const username = req.admin.username;
+  return username === supportUsername('admin') ? { $or: [{ assignedAdmin: username }, { assignedAdmin: { $exists: false } }] } : { assignedAdmin: username };
+}
 // PUBLIC: Start or get chat session
 app.post('/api/chat/session', async (req, res) => {
   try {
-    const { sessionId, userName, userEmail } = req.body;
+    const { sessionId, userName, userEmail, supportAdmin } = req.body;
+    if (typeof sessionId !== 'string' || !sessionId) return res.status(400).json({ error: 'Session required' });
+    if (supportAdmin && !['admin', 'admin2'].includes(supportAdmin)) return res.status(400).json({ error: 'Invalid admin' });
+    const assignedAdmin = supportUsername(supportAdmin);
+    if (!await Admin.exists({ username: assignedAdmin })) return res.status(503).json({ error: 'This support admin is not available yet' });
     let chat = await Chat.findOne({ sessionId });
     if (!chat) {
-      chat = await Chat.create({ sessionId, userName: userName||'Guest', userEmail: userEmail||'', messages: [] });
+      chat = await Chat.create({ sessionId, assignedAdmin, userName: userName||'Guest', userEmail: userEmail||'', messages: [] });
     }
+    if (!chat) return res.status(404).json({ error: 'Chat not found' });
     res.json(chat);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -456,10 +475,11 @@ app.post('/api/chat/message', async (req, res) => {
       {
         $push: { messages: { role: 'user', text: text||'', image: image||null, timestamp: new Date() } },
         $inc:  { unread: 1 },
-        $set:  { updatedAt: new Date(), userName: userName||'Guest', userEmail: userEmail||'' }
+        $set:  { resolved: false, updatedAt: new Date(), userName: userName||'Guest', userEmail: userEmail||'' }
       },
-      { new: true, upsert: true }
+      { new: true }
     );
+    if (!chat) return res.status(404).json({ error: 'Chat not found' });
     res.json(chat);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -476,7 +496,7 @@ app.get('/api/chat/session/:sessionId', async (req, res) => {
 // ADMIN: Get all chat sessions
 app.get('/api/chat/sessions', authRequired, async (req, res) => {
   try {
-    const chats = await Chat.find().sort({ updatedAt: -1 }).lean();
+    const chats = await Chat.find(adminChatFilter(req)).sort({ updatedAt: -1 }).lean();
     res.json(chats);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -487,13 +507,14 @@ app.post('/api/chat/reply', authRequired, async (req, res) => {
     const { sessionId, text, image } = req.body;
     if (!sessionId || (!text && !image)) return res.status(400).json({ error: 'Missing fields' });
     const chat = await Chat.findOneAndUpdate(
-      { sessionId },
+      { sessionId, ...adminChatFilter(req) },
       {
         $push: { messages: { role: 'admin', text: text||'', image: image||null, timestamp: new Date() } },
         $set:  { updatedAt: new Date() }
       },
       { new: true }
     );
+    if (!chat) return res.status(404).json({ error: 'Chat not found' });
     res.json(chat);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -501,7 +522,8 @@ app.post('/api/chat/reply', authRequired, async (req, res) => {
 // ADMIN: Mark session as read
 app.patch('/api/chat/session/:sessionId/read', authRequired, async (req, res) => {
   try {
-    await Chat.findOneAndUpdate({ sessionId: req.params.sessionId }, { $set: { unread: 0 } });
+    const chat = await Chat.findOneAndUpdate({ sessionId: req.params.sessionId, ...adminChatFilter(req) }, { $set: { unread: 0 } });
+    if (!chat) return res.status(404).json({ error: 'Chat not found' });
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -509,7 +531,8 @@ app.patch('/api/chat/session/:sessionId/read', authRequired, async (req, res) =>
 // ADMIN: Mark session as resolved
 app.patch('/api/chat/session/:sessionId/resolve', authRequired, async (req, res) => {
   try {
-    await Chat.findOneAndUpdate({ sessionId: req.params.sessionId }, { $set: { resolved: true, unread: 0 } });
+    const chat = await Chat.findOneAndUpdate({ sessionId: req.params.sessionId, ...adminChatFilter(req) }, { $set: { resolved: true, unread: 0 } });
+    if (!chat) return res.status(404).json({ error: 'Chat not found' });
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -517,7 +540,7 @@ app.patch('/api/chat/session/:sessionId/resolve', authRequired, async (req, res)
 // ADMIN: Total unread count
 app.get('/api/chat/unread', authRequired, async (req, res) => {
   try {
-    const result = await Chat.aggregate([{ $group: { _id: null, total: { $sum: '$unread' } } }]);
+    const result = await Chat.aggregate([{ $match: adminChatFilter(req) }, { $group: { _id: null, total: { $sum: '$unread' } } }]);
     res.json({ unread: result[0]?.total || 0 });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
