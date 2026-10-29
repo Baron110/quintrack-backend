@@ -35,6 +35,7 @@ const journeyStopSchema = new mongoose.Schema({
 }, { _id: false });
 
 const shipmentSchema = new mongoose.Schema({
+  ownerAdmin: { type: String, required: true, immutable: true, index: true },
   id:        { type: String, required: true, unique: true, index: true },
   status:    { type: String, enum: ['Pending','In Transit','Out for Delivery','Delivered'], default: 'Pending' },
   pct:       { type: Number, min: 0, max: 100, default: 0 },
@@ -338,10 +339,21 @@ app.post('/api/auth/login', async (req, res) => {
   } catch { res.status(500).json({ error: 'Server error' }); }
 });
 
-// PUBLIC: GET single shipment
-app.get('/api/shipments/:id', async (req, res) => {
+function shipmentOwnerFilter(req) {
+  const username = req.admin.username;
+  return username === (process.env.ADMIN_USERNAME || 'admin')
+    ? { $or: [{ ownerAdmin: username }, { ownerAdmin: { $exists: false } }] }
+    : { ownerAdmin: username };
+}
+function optionalAdminAuth(req, res, next) {
+  if (req.headers.authorization) return authRequired(req, res, next);
+  next();
+}
+
+// PUBLIC: GET single shipment (authenticated admins are restricted to their own jobs)
+app.get('/api/shipments/:id', optionalAdminAuth, async (req, res) => {
   try {
-    const shipment = await Shipment.findOne({ id: req.params.id.toUpperCase() }).lean();
+    const shipment = await Shipment.findOne({ id: req.params.id.toUpperCase(), ...(req.admin ? shipmentOwnerFilter(req) : {}) }).select('-ownerAdmin').lean();
     if (!shipment) return res.status(404).json({ error: 'Shipment not found' });
     res.json(shipment);
   } catch { res.status(500).json({ error: 'Server error' }); }
@@ -357,7 +369,7 @@ app.get('/api/shipments', authRequired, async (req, res) => {
       { 'receiver.name': { $regex: q, $options: 'i' } },
       { 'package.content': { $regex: q, $options: 'i' } }
     ]} : {};
-    const shipments = await Shipment.find(filter).sort({ createdAt: -1 }).lean();
+    const shipments = await Shipment.find({ $and: [shipmentOwnerFilter(req), filter] }).sort({ createdAt: -1 }).lean();
     res.json(shipments);
   } catch { res.status(500).json({ error: 'Server error' }); }
 });
@@ -365,7 +377,7 @@ app.get('/api/shipments', authRequired, async (req, res) => {
 // PROTECTED: CREATE shipment + send email
 app.post('/api/shipments', authRequired, async (req, res) => {
   try {
-    const data = req.body;
+    const data = { ...req.body, ownerAdmin: req.admin.username };
     if (!data.id) data.id = genId();
     data.id = data.id.toUpperCase();
     const exists = await Shipment.findOne({ id: data.id });
@@ -381,10 +393,13 @@ app.post('/api/shipments', authRequired, async (req, res) => {
 // PROTECTED: UPDATE shipment + send status email
 app.patch('/api/shipments/:id', authRequired, async (req, res) => {
   try {
-    const oldShipment = await Shipment.findOne({ id: req.params.id.toUpperCase() });
+    const allowed = ['status', 'pct', 'itemPhoto', 'sender', 'receiver', 'package', 'journey'];
+    const updates = Object.fromEntries(Object.entries(req.body).filter(([key]) => allowed.includes(key) || /^package\.(content|qty|weight|from|orderType|shipDate|expDate)$/.test(key)));
+    const filter = { id: req.params.id.toUpperCase(), ...shipmentOwnerFilter(req) };
+    const oldShipment = await Shipment.findOne(filter);
     const shipment = await Shipment.findOneAndUpdate(
-      { id: req.params.id.toUpperCase() },
-      { $set: req.body },
+      filter,
+      { $set: updates },
       { new: true, runValidators: true }
     );
     if (!shipment) return res.status(404).json({ error: 'Shipment not found' });
@@ -400,7 +415,7 @@ app.patch('/api/shipments/:id', authRequired, async (req, res) => {
 // PROTECTED: DELETE shipment
 app.delete('/api/shipments/:id', authRequired, async (req, res) => {
   try {
-    const result = await Shipment.deleteOne({ id: req.params.id.toUpperCase() });
+    const result = await Shipment.deleteOne({ id: req.params.id.toUpperCase(), ...shipmentOwnerFilter(req) });
     if (result.deletedCount === 0) return res.status(404).json({ error: 'Not found' });
     res.json({ message: 'Deleted' });
   } catch { res.status(500).json({ error: 'Server error' }); }
@@ -410,8 +425,8 @@ app.delete('/api/shipments/:id', authRequired, async (req, res) => {
 app.get('/api/stats', authRequired, async (req, res) => {
   try {
     const [total, transit, delivered, pending] = await Promise.all([
-      Shipment.countDocuments(),
-      Shipment.countDocuments({ status: { $in: ['In Transit','Out for Delivery'] } }),
+      Shipment.countDocuments(shipmentOwnerFilter(req)),
+      Shipment.countDocuments({ ...shipmentOwnerFilter(req), status: { $in: ['In Transit','Out for Delivery'] } }),
       Shipment.countDocuments({ status: 'Delivered' }),
       Shipment.countDocuments({ status: 'Pending' })
     ]);
