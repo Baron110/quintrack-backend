@@ -40,7 +40,7 @@ const journeyStopSchema = new mongoose.Schema({
 const shipmentSchema = new mongoose.Schema({
   ownerAdmin: { type: String, required: true, immutable: true, index: true },
   id:        { type: String, required: true, unique: true, index: true },
-  status:    { type: String, enum: ['Pending','In Transit','Out for Delivery','Delivered'], default: 'Pending' },
+  status:    { type: String, enum: ['Pending','On Hold','In Transit','Out for Delivery','Delivered'], default: 'Pending' },
   pct:       { type: Number, min: 0, max: 100, default: 0 },
   itemPhoto: { type: String, default: null },
   sender:    { name: String, address: String, city: String, zip: String, tel: String, email: String },
@@ -103,6 +103,7 @@ async function sendTrackingEmail(shipment, trackingUrl) {
 
   const statusMessages = {
     'Pending':          { subject: `Your Shipment ${shipment.id} Has Been Registered`, heading: 'Your shipment has been registered! 📋', body: `Hi <strong style="color:#111827;">${shipment.receiver?.name || 'there'}</strong>, your shipment has been registered and is being prepared for dispatch.` },
+    'On Hold': { subject: `Your Shipment ${shipment.id} Is On Hold`, heading: 'Your shipment is on hold', body: 'Your shipment is temporarily paused. Please contact shipment support for more information.' },
     'In Transit':       { subject: `Your Shipment ${shipment.id} Is Currently In Transit`, heading: 'Your shipment is on its way! 🚚', body: `Hi <strong style="color:#111827;">${shipment.receiver?.name || 'there'}</strong>, your shipment is currently in transit and being tracked in real-time.` },
     'Out for Delivery': { subject: `Your Shipment ${shipment.id} Is Out for Delivery!`, heading: 'Your shipment is out for delivery! 🏃', body: `Hi <strong style="color:#111827;">${shipment.receiver?.name || 'there'}</strong>, great news — your shipment is out for delivery and should arrive soon!` },
     'Delivered':        { subject: `Your Shipment ${shipment.id} Has Been Delivered`, heading: 'Your shipment has been delivered! ✅', body: `Hi <strong style="color:#111827;">${shipment.receiver?.name || 'there'}</strong>, your shipment has been successfully delivered. Thank you for using QUIN-TRACK.` },
@@ -229,7 +230,7 @@ async function sendStatusUpdateEmail(shipment, trackingUrl) {
   const recipientEmail = shipment.receiver?.email;
   if (!recipientEmail) return;
   const fromEmail = process.env.FROM_EMAIL || 'onboarding@resend.dev';
-  const statusColor = {'Pending':'#d97706','In Transit':'#2563eb','Out for Delivery':'#0891b2','Delivered':'#16a34a'}[shipment.status] || '#2563eb';
+  const statusColor = {'On Hold':'#c2410c','Pending':'#d97706','In Transit':'#2563eb','Out for Delivery':'#0891b2','Delivered':'#16a34a'}[shipment.status] || '#2563eb';
   try {
     const result = await resend.emails.send({
       from: `QUIN-TRACK Logistics <${fromEmail}>`,
@@ -435,8 +436,8 @@ app.get('/api/stats', authRequired, async (req, res) => {
     const [total, transit, delivered, pending] = await Promise.all([
       Shipment.countDocuments(shipmentOwnerFilter(req)),
       Shipment.countDocuments({ ...shipmentOwnerFilter(req), status: { $in: ['In Transit','Out for Delivery'] } }),
-      Shipment.countDocuments({ status: 'Delivered' }),
-      Shipment.countDocuments({ status: 'Pending' })
+      Shipment.countDocuments({ ...shipmentOwnerFilter(req), status: 'Delivered' }),
+      Shipment.countDocuments({ ...shipmentOwnerFilter(req), status: 'Pending' })
     ]);
     res.json({ total, transit, delivered, pending });
   } catch { res.status(500).json({ error: 'Server error' }); }
