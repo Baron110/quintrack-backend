@@ -1,4 +1,5 @@
 const express = require('express');
+const crypto = require('crypto');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
@@ -7,6 +8,8 @@ const { Resend } = require('resend');
 require('dotenv').config();
 
 const app = express();
+// Use an unpredictable fallback instead of a publicly known signing key.
+const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(48).toString('hex');
 
 // ── MIDDLEWARE ──
 app.use(cors({ origin: process.env.FRONTEND_URL || '*' }));
@@ -84,7 +87,8 @@ function authRequired(req, res, next) {
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return res.status(401).json({ error: 'No token' });
   try {
-    req.admin = jwt.verify(token, process.env.JWT_SECRET || 'qt-secret');
+    req.admin = jwt.verify(token, JWT_SECRET);
+    if (req.admin.purpose === 'shipment-chat') return res.status(401).json({ error: 'Admin login required' });
     next();
   } catch {
     res.status(401).json({ error: 'Invalid token' });
@@ -334,7 +338,7 @@ app.post('/api/auth/login', async (req, res) => {
     if (!admin) return res.status(401).json({ error: 'Invalid credentials' });
     const match = await bcrypt.compare(password, admin.password);
     if (!match) return res.status(401).json({ error: 'Invalid credentials' });
-    const token = jwt.sign({ username }, process.env.JWT_SECRET || 'qt-secret', { expiresIn: '8h' });
+    const token = jwt.sign({ username }, JWT_SECRET, { expiresIn: '8h' });
     res.json({ token, username });
   } catch { res.status(500).json({ error: 'Server error' }); }
 });
@@ -355,6 +359,10 @@ app.get('/api/shipments/:id', optionalAdminAuth, async (req, res) => {
   try {
     const shipment = await Shipment.findOne({ id: req.params.id.toUpperCase(), ...(req.admin ? shipmentOwnerFilter(req) : {}) }).select('-ownerAdmin').lean();
     if (!shipment) return res.status(404).json({ error: 'Shipment not found' });
+    if (!req.admin) {
+      if (shipment.receiver) delete shipment.receiver.tel;
+      if (shipment.sender) delete shipment.sender.tel;
+    }
     res.json(shipment);
   } catch { res.status(500).json({ error: 'Server error' }); }
 });
@@ -447,7 +455,9 @@ app.listen(PORT, () => console.log(`🚚 QUIN-TRACK API on port ${PORT}`));
 // ══════════════════
 
 const chatSchema = new mongoose.Schema({
-  sessionId:  { type: String, required: true, index: true },
+  shipmentId: { type: String, index: true },
+  phoneKey: { type: String, select: false },
+  sessionId:  { type: String, required: true, unique: true, index: true },
   assignedAdmin: { type: String, default: () => process.env.ADMIN_USERNAME || 'admin', index: true },
   userName:   { type: String, default: 'Guest' },
   userEmail:  { type: String, default: '' },
@@ -471,49 +481,77 @@ function adminChatFilter(req) {
   const username = req.admin.username;
   return username === supportUsername('admin') ? { $or: [{ assignedAdmin: username }, { assignedAdmin: { $exists: false } }] } : { assignedAdmin: username };
 }
-// PUBLIC: Start or get chat session
+// Shipment chats require a matching receiver phone, then a short-lived signed token.
+function normalizePhone(value) { return typeof value === 'string' ? value.replace(/\D/g, '') : ''; }
+function chatPhoneKey(phone) {
+  return crypto.createHmac('sha256', JWT_SECRET).update(phone).digest('hex');
+}
+const unlockAttempts = new Map();
 app.post('/api/chat/session', async (req, res) => {
+  const key = req.ip;
+  const now = Date.now();
+  for (const [ip, attempt] of unlockAttempts) if (attempt.until < now) unlockAttempts.delete(ip);
+  const attempt = unlockAttempts.get(key) || { count: 0, until: now + 15 * 60 * 1000 };
+  if (++attempt.count > 15) return res.status(429).json({ error: 'Too many attempts. Try again in 15 minutes.' });
+  unlockAttempts.set(key, attempt);
   try {
-    const { sessionId, userName, userEmail, supportAdmin } = req.body;
-    if (typeof sessionId !== 'string' || !sessionId) return res.status(400).json({ error: 'Session required' });
-    if (supportAdmin && !['admin', 'admin2'].includes(supportAdmin)) return res.status(400).json({ error: 'Invalid admin' });
-    const assignedAdmin = supportUsername(supportAdmin);
-    if (!await Admin.exists({ username: assignedAdmin })) return res.status(503).json({ error: 'This support admin is not available yet' });
-    let chat = await Chat.findOne({ sessionId });
-    if (!chat) {
-      chat = await Chat.create({ sessionId, assignedAdmin, userName: userName||'Guest', userEmail: userEmail||'', messages: [] });
-    }
+    const { trackingId, phone, userName, userEmail } = req.body;
+    const normalized = normalizePhone(phone);
+    if (typeof trackingId !== 'string' || normalized.length < 7 || normalized.length > 15 || typeof userName !== 'string' || !userName.trim())
+      return res.status(400).json({ error: 'Enter your tracking number, receiver phone, and name.' });
+    const shipment = await Shipment.findOne({ id: trackingId.trim().toUpperCase() });
+    if (!shipment || normalizePhone(shipment.receiver?.tel) !== normalized)
+      return res.status(403).json({ error: 'Tracking number or receiver phone does not match.' });
+    unlockAttempts.delete(key);
+    const phoneKey = chatPhoneKey(normalized);
+    const sessionId = 'ship_' + chatPhoneKey(shipment.id + ':' + normalized);
+    const assignedAdmin = shipment.ownerAdmin || process.env.ADMIN_USERNAME || 'admin';
+    const chat = await Chat.findOneAndUpdate({ sessionId }, {
+      $set: { assignedAdmin, userName: userName.trim().slice(0, 80), userEmail: typeof userEmail === 'string' ? userEmail.slice(0, 254) : '' },
+      $setOnInsert: { sessionId, shipmentId: shipment.id, phoneKey, messages: [] }
+    }, { new: true, upsert: true });
+    const chatToken = jwt.sign({ purpose: 'shipment-chat', sessionId, shipmentId: shipment.id, phoneKey }, JWT_SECRET, { expiresIn: '8h' });
+    res.json({ chatToken, chat });
+  } catch { res.status(500).json({ error: 'Unable to unlock chat' }); }
+});
+async function chatAccess(req, res, next) {
+  if (req.headers.authorization) return authRequired(req, res, () => {
+    req.chatFilter = adminChatFilter(req);
+    next();
+  });
+  try {
+    const claims = jwt.verify(req.headers['x-chat-token'], JWT_SECRET);
+    const sessionId = req.params.sessionId || req.body.sessionId;
+    if (claims.purpose !== 'shipment-chat' || claims.sessionId !== sessionId) throw new Error('Invalid access');
+    const shipment = await Shipment.findOne({ id: claims.shipmentId });
+    if (!shipment || chatPhoneKey(normalizePhone(shipment.receiver?.tel)) !== claims.phoneKey) throw new Error('Access changed');
+    req.chatFilter = { shipmentId: claims.shipmentId, assignedAdmin: shipment.ownerAdmin || process.env.ADMIN_USERNAME || 'admin' };
+    next();
+  } catch { res.status(401).json({ error: 'Unlock shipment chat again to continue.' }); }
+}
+function validChatMessage(text, image) {
+  return (!text || typeof text === 'string' && text.length <= 10000) &&
+    (!image || typeof image === 'string' && image.length <= 7000000 && /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(image)) && !!(text || image);
+}
+app.post('/api/chat/message', chatAccess, async (req, res) => {
+  if (req.admin) return res.status(403).json({ error: 'Use the admin reply route' });
+  try {
+    const { sessionId, text, image } = req.body;
+    if (!validChatMessage(text, image)) return res.status(400).json({ error: 'Enter a message or a supported image (maximum 5 MB).' });
+    const chat = await Chat.findOneAndUpdate({ sessionId, ...req.chatFilter }, {
+      $push: { messages: { role: 'user', text: text || '', image: image || null, timestamp: new Date() } },
+      $inc: { unread: 1 }, $set: { resolved: false, updatedAt: new Date() }
+    }, { new: true });
     if (!chat) return res.status(404).json({ error: 'Chat not found' });
     res.json(chat);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch { res.status(500).json({ error: 'Unable to send message' }); }
 });
-
-// PUBLIC: Send message (user)
-app.post('/api/chat/message', async (req, res) => {
+app.get('/api/chat/session/:sessionId', chatAccess, async (req, res) => {
   try {
-    const { sessionId, text, image, userName, userEmail } = req.body;
-    if (!sessionId || (!text && !image)) return res.status(400).json({ error: 'Missing fields' });
-    const chat = await Chat.findOneAndUpdate(
-      { sessionId },
-      {
-        $push: { messages: { role: 'user', text: text||'', image: image||null, timestamp: new Date() } },
-        $inc:  { unread: 1 },
-        $set:  { resolved: false, updatedAt: new Date(), userName: userName||'Guest', userEmail: userEmail||'' }
-      },
-      { new: true }
-    );
+    const chat = await Chat.findOne({ sessionId: req.params.sessionId, ...req.chatFilter });
     if (!chat) return res.status(404).json({ error: 'Chat not found' });
     res.json(chat);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// PUBLIC: Get messages for a session
-app.get('/api/chat/session/:sessionId', async (req, res) => {
-  try {
-    const chat = await Chat.findOne({ sessionId: req.params.sessionId });
-    if (!chat) return res.json({ messages: [] });
-    res.json(chat);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch { res.status(500).json({ error: 'Unable to load chat' }); }
 });
 
 // ADMIN: Get all chat sessions
@@ -528,7 +566,7 @@ app.get('/api/chat/sessions', authRequired, async (req, res) => {
 app.post('/api/chat/reply', authRequired, async (req, res) => {
   try {
     const { sessionId, text, image } = req.body;
-    if (!sessionId || (!text && !image)) return res.status(400).json({ error: 'Missing fields' });
+    if (typeof sessionId !== 'string' || !validChatMessage(text, image)) return res.status(400).json({ error: 'Invalid message' });
     const chat = await Chat.findOneAndUpdate(
       { sessionId, ...adminChatFilter(req) },
       {
