@@ -466,6 +466,7 @@ const chatSchema = new mongoose.Schema({
     role:      { type: String, enum: ['user','admin'], required: true },
     text:      { type: String, default: '' },
     image:     { type: String, default: null },
+    attachment: { fileId: String, name: String, mimeType: String, size: Number },
     timestamp: { type: Date, default: Date.now }
   }],
   unread:     { type: Number, default: 0 },
@@ -474,6 +475,12 @@ const chatSchema = new mongoose.Schema({
   updatedAt:  { type: Date, default: Date.now }
 });
 const Chat = mongoose.model('Chat', chatSchema);
+const ChatFile = mongoose.model('ChatFile', new mongoose.Schema({
+  fileId: { type: String, unique: true, required: true },
+  sessionId: { type: String, required: true, index: true },
+  dataUrl: { type: String, required: true },
+  createdAt: { type: Date, default: Date.now }
+}));
 
 function supportUsername(target) {
   return target === 'admin2' ? (process.env.ADMIN2_USERNAME || 'admin2') : (process.env.ADMIN_USERNAME || 'admin');
@@ -530,17 +537,42 @@ async function chatAccess(req, res, next) {
     next();
   } catch { res.status(401).json({ error: 'Unlock shipment chat again to continue.' }); }
 }
-function validChatMessage(text, image) {
-  return (!text || typeof text === 'string' && text.length <= 10000) &&
-    (!image || typeof image === 'string' && image.length <= 7000000 && /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(image)) && !!(text || image);
+function validPdfAttachment(file) {
+  if (!file || typeof file !== 'object' || typeof file.name !== 'string' || !file.name.trim() || file.name.length > 200 || file.mimeType !== 'application/pdf' || typeof file.dataUrl !== 'string') return false;
+  const match = /^data:application\/pdf;base64,([A-Za-z0-9+/]+={0,2})$/.exec(file.dataUrl);
+  if (!match || match[1].length > 6990508 || match[1].length % 4 !== 0) return false;
+  const bytes = Buffer.from(match[1], 'base64');
+  return bytes.length > 5 && bytes.length <= 5 * 1024 * 1024 && file.size === bytes.length && bytes.subarray(0, 5).toString('ascii') === '%PDF-';
 }
+function validChatMessage(text, image, attachment) {
+  return (!text || typeof text === 'string' && text.length <= 10000) &&
+    (!image || typeof image === 'string' && image.length <= 7000000 && /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(image)) && (!attachment || !image && validPdfAttachment(attachment)) && !!(text || image || attachment);
+}
+async function storeChatPdf(attachment, sessionId, filter) {
+  if (!attachment) return undefined;
+  if (!await Chat.findOne({ sessionId, ...filter })) throw new Error('Chat not found');
+  const fileId = crypto.randomUUID();
+  await ChatFile.create({ fileId, sessionId, dataUrl: attachment.dataUrl });
+  return { fileId, name: attachment.name, mimeType: 'application/pdf', size: attachment.size };
+}
+app.get('/api/chat/session/:sessionId/attachment/:fileId', chatAccess, async (req, res) => {
+  try {
+    const chat = await Chat.findOne({ sessionId: req.params.sessionId, ...req.chatFilter });
+    if (!chat || !chat.messages.some(m => m.attachment?.fileId === req.params.fileId)) return res.status(404).json({ error: 'Attachment not found' });
+    const file = await ChatFile.findOne({ sessionId: req.params.sessionId, fileId: req.params.fileId });
+    if (!file) return res.status(404).json({ error: 'Attachment not found' });
+    res.set('Cache-Control', 'no-store');
+    res.json({ dataUrl: file.dataUrl });
+  } catch { res.status(500).json({ error: 'Unable to load attachment' }); }
+});
 app.post('/api/chat/message', chatAccess, async (req, res) => {
   if (req.admin) return res.status(403).json({ error: 'Use the admin reply route' });
   try {
-    const { sessionId, text, image } = req.body;
-    if (!validChatMessage(text, image)) return res.status(400).json({ error: 'Enter a message or a supported image (maximum 5 MB).' });
+    const { sessionId, text, image, attachment } = req.body;
+    if (!validChatMessage(text, image, attachment)) return res.status(400).json({ error: 'Send text, an image, or a PDF up to 5 MB.' });
+    const savedAttachment = await storeChatPdf(attachment, sessionId, req.chatFilter);
     const chat = await Chat.findOneAndUpdate({ sessionId, ...req.chatFilter }, {
-      $push: { messages: { role: 'user', text: text || '', image: image || null, timestamp: new Date() } },
+      $push: { messages: { role: 'user', text: text || '', image: image || null, attachment: savedAttachment, timestamp: new Date() } },
       $inc: { unread: 1 }, $set: { resolved: false, updatedAt: new Date() }
     }, { new: true });
     if (!chat) return res.status(404).json({ error: 'Chat not found' });
@@ -566,12 +598,13 @@ app.get('/api/chat/sessions', authRequired, async (req, res) => {
 // ADMIN: Reply to a chat
 app.post('/api/chat/reply', authRequired, async (req, res) => {
   try {
-    const { sessionId, text, image } = req.body;
-    if (typeof sessionId !== 'string' || !validChatMessage(text, image)) return res.status(400).json({ error: 'Invalid message' });
+    const { sessionId, text, image, attachment } = req.body;
+    if (typeof sessionId !== 'string' || !validChatMessage(text, image, attachment)) return res.status(400).json({ error: 'Invalid message' });
+    const savedAttachment = await storeChatPdf(attachment, sessionId, adminChatFilter(req));
     const chat = await Chat.findOneAndUpdate(
       { sessionId, ...adminChatFilter(req) },
       {
-        $push: { messages: { role: 'admin', text: text||'', image: image||null, timestamp: new Date() } },
+        $push: { messages: { role: 'admin', text: text||'', image: image||null, attachment: savedAttachment, timestamp: new Date() } },
         $set:  { updatedAt: new Date() }
       },
       { new: true }
